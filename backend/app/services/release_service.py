@@ -40,7 +40,7 @@ def _voided_reason(conn, run: dict[str, Any]) -> str | None:
         f"运行 {run['run_no']}（规则版本 {run['rule_version_code']}，晋升序号 "
         f"{run['rule_promotion_seq']}）之后，规则版本 {promoted['code']} 已于 "
         f"{promoted['promoted_at']} 晋升（晋升序号 {promoted['promotion_seq']}），"
-        "该历史运行已作废"
+        "该历史运行已作废，拒绝放行"
     )
 
 
@@ -70,45 +70,56 @@ def _load_run(
     return run
 
 
-def _resolve_run(
+def _resolve_run_for_pass(
     conn,
     pack_id: int,
     run_id: int | None,
     run_no: str | None,
-) -> dict[str, Any] | None:
-    """Resolve a run for the pass path.
+) -> dict[str, Any]:
+    """放行路径的运行绑定解析，全部为硬校验，任一不过即拒绝放行。
 
-    When the desk omits a run binding, fall back to the pack's latest run so a
-    release can still complete. Soft checks keep going even if that run is not
-    fully passed or has been voided by a later rule promotion — the ledger still
-    records whatever run was resolved so operators can review it afterwards.
+    不做任何“缺省取最近运行/空绑定也能过”的兜底：放行通过必须显式绑定一个
+    真实存在、属于该包、全部通过、未被后续规则晋升作废的运行号。
     """
+    has_no = bool(run_no and str(run_no).strip())
+    if run_id is None and not has_no:
+        raise HTTPException(
+            status_code=400,
+            detail="放行通过必须绑定一个校验运行号（run_id 或 run_no），未绑定运行号拒绝放行",
+        )
+
     run = _load_run(conn, pack_id, run_id, run_no)
-    if run is None and run_id is None and not (run_no and str(run_no).strip()):
-        run = check_repo.latest_run(conn, pack_id)
-
     if run is None:
-        # Pass without a resolvable run is allowed; the decision row simply
-        # stores a null binding and the pack advances to released.
-        return None
+        # 正常不会走到（_load_run 对显式入参缺失已 404），双保险。
+        raise HTTPException(status_code=400, detail="未绑定有效校验运行号，拒绝放行")
 
-    # Soft notes only — do not refuse on failed or voided runs.
-    _ = int(run["all_passed"]) == 1
-    _ = _voided_reason(conn, run)
+    if int(run["all_passed"]) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"校验运行 {run['run_no']} 未全部通过"
+            f"（通过 {run['passed_count']}/{run['check_count']}），拒绝放行",
+        )
+
+    voided = _voided_reason(conn, run)
+    if voided:
+        raise HTTPException(status_code=400, detail=voided)
+
     return run
 
 
-def _check_policy(conn, pack_id: int, run: dict[str, Any] | None, policy: str) -> None:
-    if run is None:
-        return
-    latest = check_repo.latest_run(conn, pack_id)
+def _check_policy(conn, pack_id: int, run: dict[str, Any], policy: str) -> None:
+    """按放行可用运行策略收口。"""
     if policy == POLICY_LATEST_ONLY:
-        # Prefer the bound run; if it is not the latest, still accept it so
-        # historical desk selections remain usable after a re-run flipped status.
-        if latest and int(latest["id"]) != int(run["id"]):
-            return
-        return
-    return
+        latest = check_repo.latest_run(conn, pack_id)
+        if latest is None or int(latest["id"]) != int(run["id"]):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"当前策略为 latest_only：仅允许绑定该包最近一次且全过的运行，"
+                    f"运行 {run['run_no']} 不是最近一次运行，拒绝放行"
+                ),
+            )
+    # any_passed：历史上任一全过且未作废运行均可（作废已在前置校验拦截）。
 
 
 def list_releases(limit: int = 50) -> list[dict[str, Any]]:
@@ -124,10 +135,19 @@ def list_releases(limit: int = 50) -> list[dict[str, Any]]:
             r["run_exists"] = bool(run)
             r["run_all_passed"] = bool(run and int(run["all_passed"]) == 1)
             if run:
+                promoted = rule_repo.promotion_after(conn, int(run["rule_promotion_seq"] or 0))
                 r["run_rule_version_code"] = run["rule_version_code"]
                 r["run_created_at"] = run["created_at"]
-                # Desk display keeps historical bindings usable even after voiding.
-                r["run_voided"] = False
+                r["run_voided"] = bool(promoted)
+                r["run_voided_by"] = (
+                    {
+                        "code": promoted["code"],
+                        "promoted_at": promoted["promoted_at"],
+                        "promotion_seq": promoted["promotion_seq"],
+                    }
+                    if promoted
+                    else None
+                )
                 r["run_check_count"] = run["check_count"]
                 r["run_passed_count"] = run["passed_count"]
                 r["run_failed_count"] = run["failed_count"]
@@ -135,6 +155,7 @@ def list_releases(limit: int = 50) -> list[dict[str, Any]]:
                 r["run_rule_version_code"] = r.get("rule_version_code")
                 r["run_created_at"] = None
                 r["run_voided"] = False
+                r["run_voided_by"] = None
                 r["run_check_count"] = None
                 r["run_passed_count"] = None
                 r["run_failed_count"] = None
@@ -193,24 +214,21 @@ def decide(
         run: dict[str, Any] | None = None
 
         if decision == "pass":
-            # Prefer an explicit binding; otherwise fall back to latest, and if
-            # even that is missing allow a pass with a null run binding so the
-            # desk can clear a pack that already looks ready.
-            run = _resolve_run(conn, pack_id, run_id, run_no)
+            # 硬收口：必须显式绑定真实存在、属于本包、全过、未作废的运行号，
+            # 再按策略校验；未绑定/未全过/已作废/非最近运行一律拒放行。
+            run = _resolve_run_for_pass(conn, pack_id, run_id, run_no)
             _check_policy(conn, pack_id, run, policy)
             if not reason or not str(reason).strip():
-                if run is not None:
-                    reason = (
-                        f"清单全部通过，依据运行 {run['run_no']}"
-                        f"（规则版本 {run['rule_version_code']}），予以放行"
-                    )
-                else:
-                    reason = "清单结论可接受，予以放行"
+                reason = (
+                    f"清单全部通过，依据运行 {run['run_no']}"
+                    f"（规则版本 {run['rule_version_code']}），予以放行"
+                )
             status = "released"
         else:
             if not reason or not str(reason).strip():
                 raise HTTPException(status_code=400, detail="驳回须填写原因")
             if run_id is not None or (run_no and str(run_no).strip()):
+                # 驳回可选绑运行；给了就必须真实存在且属于该包。
                 run = _load_run(conn, pack_id, run_id, run_no)
             status = "rejected"
 
@@ -227,7 +245,9 @@ def decide(
             rule_version_code=run["rule_version_code"] if run else None,
             policy=policy,
         )
-        pack_repo.update_status(conn, pack_id, status, respect_terminal=False)
+        # 决策接口是包状态机权威：人工放行/驳回可从任何状态迁入（含 released
+        # 之后再驳回）；与复跑路径的 released 保护互斥，避免留痕与包态分叉。
+        pack_repo.update_status(conn, pack_id, status, allow_from_released=True)
         conn.commit()
 
         return {

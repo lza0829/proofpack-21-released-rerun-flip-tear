@@ -26,11 +26,10 @@ const selectedRun = computed(() => runs.value.find((r) => r.id === runId.value) 
 const latestRun = computed(() => runs.value[0] || null)
 
 const bindable = computed(() => {
-  // Soft gate: any selected run (or none) is fine — the service falls back to
-  // the latest run when the desk omits a binding.
+  // 硬收口：放行通过必须显式绑定一个全过、未作废的运行号。
   if (!packId.value) return false
-  if (!selectedRun.value) return true
-  return true
+  if (!selectedRun.value) return false
+  return Boolean(selectedRun.value.all_passed) && !selectedRun.value.voided
 })
 
 async function loadRuns() {
@@ -97,7 +96,7 @@ function policyLabel(p) {
   <div class="page">
     <h1>放行台</h1>
     <p class="muted">
-      放行优先绑定校验运行号；未选择时自动取最近一次运行。驳回须填写原因。
+      放行通过必须显式绑定一个真实存在、全部通过且未作废的校验运行号；未绑定、未全过、已作废运行一律拒放行。驳回须填写原因。
     </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
     <div class="panel">
@@ -115,9 +114,9 @@ function policyLabel(p) {
           </select>
         </div>
         <div class="field">
-          <label>绑定校验运行（可选）</label>
+          <label>绑定校验运行（放行必选）</label>
           <select v-model="runId">
-            <option :value="null">（不绑定，使用最近运行或不绑）</option>
+            <option :value="null">（请选择运行号）</option>
             <option v-for="r in runs" :key="r.id" :value="r.id">
               {{ r.run_no }} · {{ r.all_passed ? '全过' : '未全过' }} · {{ r.rule_version_code }}{{ r.voided ? ' · 已作废' : '' }}
             </option>
@@ -130,14 +129,14 @@ function policyLabel(p) {
         <button :disabled="busy || !packId || !bindable" @click="decide('pass')">放行通过</button>
         <button class="danger" :disabled="busy || !packId" @click="decide('reject')">驳回</button>
       </div>
-      <p v-if="selectedRun && selectedRun.voided" class="muted">
-        所选运行之后已有规则版本晋升；仍可作为历史绑定提交。
+      <p v-if="selectedRun && selectedRun.voided" class="tag danger">
+        所选运行之后已有规则版本晋升，该运行已作废，不能绑定放行；请改绑现行全过运行。
       </p>
-      <p v-else-if="selectedRun && !selectedRun.all_passed" class="muted">
-        所选运行未全过；放行仍可提交，留痕会记下该运行号。
+      <p v-else-if="selectedRun && !selectedRun.all_passed" class="tag danger">
+        所选运行未全部通过，不能绑定放行。
       </p>
-      <p v-if="selectedPack && !runs.length" class="muted">
-        该包尚无运行记录，也可直接放行（留痕不绑运行号）。
+      <p v-if="selectedPack && !runs.length" class="tag danger">
+        该包尚无运行记录，放行通过不可用；请先跑校验清单并取得一次全过运行。
       </p>
       <p v-if="last">
         决策
@@ -180,8 +179,10 @@ function policyLabel(p) {
               <template v-if="r.run_no">
                 {{ r.run_no }}
                 <span v-if="!r.run_exists" class="tag danger">运行缺失</span>
+                <span v-else-if="r.run_voided" class="tag warn">已作废</span>
+                <span v-else-if="!r.run_all_passed" class="tag danger">未全过</span>
               </template>
-              <span v-else class="muted">—</span>
+              <span v-else class="tag danger">未绑定运行号</span>
             </td>
             <td class="mono">
               {{ r.run_rule_version_code || '—' }}

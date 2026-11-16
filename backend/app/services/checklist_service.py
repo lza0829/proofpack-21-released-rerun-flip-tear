@@ -72,9 +72,10 @@ def run_checklist(pack_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="证据包不存在")
 
         prior_status = pack["status"]
-        # Re-runs are always allowed so operators can append a fresh audit trail
-        # after release. Pack status is re-synced from the new run so the desk
-        # shows the latest checklist conclusion rather than a stale terminal label.
+        # 全局唯一收口（方案 A）：复跑始终允许，生成一条全新的独立运行记录
+        # 做审计追加，运行列表永不覆盖。但已放行（released）是终局：复跑不得
+        # 把包态改回 checked_*，原放行绑定保持有效并继续指向当时全过的运行。
+        # 已驳回（rejected）可经复跑回到 checked_*，重新走放行闭环。
         rule = rule_repo.get_active_rule_version(conn)
         if not rule:
             raise HTTPException(status_code=400, detail="当前无生效规则版本，无法执行校验清单")
@@ -165,10 +166,11 @@ def run_checklist(pack_id: int) -> dict[str, Any]:
             )
 
         next_status = "checked_ok" if all_ok else "checked_fail"
-        # Always rewrite the pack row from the newest run, including packs that
-        # were previously released or rejected — the run list is append-only and
-        # the status column is treated as a mirror of the latest conclusion.
-        pack_repo.update_status(conn, pack_id, next_status, respect_terminal=False)
+        # 已放行包不受复跑影响：仓储层对 released 行跳过更新，包态仍是 released，
+        # 新运行只进入运行列表供审计。其他状态（含 rejected）同步为本次结论。
+        pack_repo.update_status(conn, pack_id, next_status)
+        refreshed = pack_repo.get_pack(conn, pack_id)
+        effective_status = refreshed["status"] if refreshed else next_status
         conn.commit()
 
         return {
@@ -185,7 +187,8 @@ def run_checklist(pack_id: int) -> dict[str, Any]:
             "all_passed": all_ok,
             "created_at": now,
             "prior_status": prior_status,
-            "pack_status": next_status,
+            "pack_status": effective_status,
+            "status_changed": effective_status != prior_status,
             "results": check_repo.list_results(conn, run_id=run_id),
         }
     finally:

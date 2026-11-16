@@ -21,7 +21,7 @@ const STATUS_LABEL = {
 
 const selectedPack = computed(() => packs.value.find((p) => p.id === packId.value) || null)
 
-// Terminal packs stay selectable so operators can append a fresh run after release.
+// 终局包仍可复跑：已放行包只追加审计运行、状态不动；已驳回包可重新走闭环。
 const canRerun = computed(() => Boolean(packId.value) && !busy.value)
 
 async function loadRuns() {
@@ -88,7 +88,7 @@ async function onPackChange() {
   <div class="page">
     <h1>校验清单</h1>
     <p class="muted">
-      基础项：条数一致、键唯一、必填非空。每次执行都生成独立运行号；已放行/已驳回包也可复跑，包状态会同步为最近一次运行结论。
+      基础项：条数一致、键唯一、必填非空。每次执行都生成独立运行号且永不覆盖。已放行包复跑只追加审计运行，包状态保持已放行、原放行绑定持续有效；已驳回包复跑后回到校验结论，可重新绑定全过运行再放行。
     </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
     <div class="panel">
@@ -104,8 +104,11 @@ async function onPackChange() {
         </div>
         <button :disabled="!canRerun" @click="run">跑校验清单</button>
       </div>
-      <p v-if="selectedPack && (selectedPack.status === 'released' || selectedPack.status === 'rejected')" class="muted">
-        当前包处于终局状态，复跑会追加新运行并把包状态改回校验通过/未过。
+      <p v-if="selectedPack && selectedPack.status === 'released'" class="muted">
+        当前包已放行：复跑只会追加一条新运行供审计，包状态与原放行绑定保持有效，不会被改写。
+      </p>
+      <p v-else-if="selectedPack && selectedPack.status === 'rejected'" class="muted">
+        当前包已驳回：复跑会追加新运行并把包状态带回校验通过/未过，可重新绑定全过运行后再放行。
       </p>
       <p v-if="result">
         新运行 <span class="mono">{{ result.run_no }}</span>
@@ -116,7 +119,12 @@ async function onPackChange() {
           {{ result.all_passed ? '全部通过' : '存在未通过项' }}
         </span>
         <template v-if="result.pack_status">
-          · 包状态现为 <span class="tag">{{ STATUS_LABEL[result.pack_status] || result.pack_status }}</span>
+          <template v-if="result.status_changed">
+            · 包状态现为 <span class="tag">{{ STATUS_LABEL[result.pack_status] || result.pack_status }}</span>
+          </template>
+          <template v-else>
+            · 包状态保持 <span class="tag">{{ STATUS_LABEL[result.pack_status] || result.pack_status }}</span>（复跑仅追加审计运行）
+          </template>
         </template>
       </p>
     </div>
