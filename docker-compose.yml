@@ -1,0 +1,17 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10500:10500"
+    volumes:
+      - proofpack_data:/data
+    environment:
+      DATA_DIR: /data
+  frontend:
+    build: ./frontend
+    ports:
+      - "5500:80"
+    depends_on:
+      - backend
+volumes:
+  proofpack_data:
